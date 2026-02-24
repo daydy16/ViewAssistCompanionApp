@@ -18,7 +18,8 @@ media3ExoplayerDash = "1.9.0"
 media3Ui = "1.9.0"
 media3UiCompose = "1.9.0"
 okhttp = "5.3.2"
-onnxruntimeAndroid = "1.23.2"
+gson = "2.13.2"
+litert = "2.16.1"
 preferenceKtx = "1.2.1"
 semver = "3.0.0"
 splash ="1.2.0"
@@ -61,7 +62,8 @@ material3 = { group = "androidx.compose.material3", name = "material3", version.
 core-splashscreen = { group = "androidx.core", name="core-splashscreen", version.ref="splash"}
 kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinSerialization" }
 okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
-onnxruntime-android = { module = "com.microsoft.onnxruntime:onnxruntime-android", version.ref = "onnxruntimeAndroid" }
+gson = { group = "com.google.code.gson", name = "gson", version.ref = "gson" }
+litert = { module = "org.tensorflow:tensorflow-lite", version.ref = "litert" }
 semver = { module = "io.github.z4kn4fein:semver", version.ref = "semver" }
 timber = { module = "com.jakewharton.timber:timber", version.ref = "timber" }
 ui = { group = "androidx.compose.ui", name = "ui", version.ref = "ui" }
@@ -75,6 +77,7 @@ androidx-compose-foundation = { group = "androidx.compose.foundation", name = "f
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 

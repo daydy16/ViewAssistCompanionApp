@@ -6,6 +6,12 @@ plugins {
     id("com.google.firebase.crashlytics")
 }
 
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    }
+}
+
 android {
     namespace = "com.msp1974.vacompanion"
     compileSdk = 36
@@ -72,7 +78,9 @@ dependencies {
     implementation (libs.androidx.material.icons.extended)
     implementation (libs.androidx.preference.ktx)
     implementation (libs.timber)
-    implementation (libs.onnxruntime.android)
+    implementation(libs.litert)
+    implementation(libs.gson)
+    implementation(project(":microfeatures"))
     implementation (libs.semver)
     implementation (libs.okhttp)
     implementation (libs.androidx.webkit)

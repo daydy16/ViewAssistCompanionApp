@@ -11,6 +11,8 @@ import com.msp1974.vacompanion.audio.AudioDSP
 import com.msp1974.vacompanion.audio.SoundClipPlayer
 import com.msp1974.vacompanion.audio.AudioManager as AudManager
 import com.msp1974.vacompanion.broadcasts.BroadcastSender
+import com.msp1974.vacompanion.microwakeword.CombinedWakeWordProvider
+import com.msp1974.vacompanion.microwakeword.WakeWordDetector
 import com.msp1974.vacompanion.sensors.SensorUpdatesCallback
 import com.msp1974.vacompanion.sensors.Sensors
 import com.msp1974.vacompanion.settings.APPConfig
@@ -24,9 +26,6 @@ import com.msp1974.vacompanion.utils.WakeWords
 import com.msp1974.vacompanion.wyoming.WyomingCallback
 import com.msp1974.vacompanion.wyoming.WyomingTCPServer
 import com.msp1974.viewassistcompanionapp.audio.AudioRecorder
-import com.rementia.openwakeword.lib.WakeWordEngine
-import com.rementia.openwakeword.lib.model.DetectionMode
-import com.rementia.openwakeword.lib.model.WakeWordModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -50,11 +49,11 @@ internal class BackgroundTaskController (private val context: Context): EventLis
     private val job = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.Default + job)
     private var audioInJob: Job? = null
-    private var wakeWordJob: Job? = null
-    private var wakeWordEngine: WakeWordEngine? = null
     private var holdDetectionLevelJob: Job? = null
-    private var detectionScoreMonitorJob: Job? = null
     private var lastWakeWordDetectionScore = 0f
+
+    // microWakeWord detector replaces WakeWordEngine
+    private var wakeWordDetector: WakeWordDetector? = null
 
     val zeroConf: Zeroconf = Zeroconf(context)
 
@@ -132,9 +131,9 @@ internal class BackgroundTaskController (private val context: Context): EventLis
             "musicVolume" -> {
                 setVolume(AudioManager.STREAM_MUSIC, event.newValue as Float)
             }
-            "wakeWord", "wakeWordThreshold" -> {
+            "wakeWord" -> {
                 scope.launch {
-                    if (wakeWordJob != null && wakeWordJob!!.isActive) {
+                    if (audioInJob != null && audioInJob!!.isActive) {
                         restartWakeWordDetection()
                     } else if (server.pipelineClient != null) {
                         startOpenWakeWordDetection()
@@ -227,7 +226,7 @@ internal class BackgroundTaskController (private val context: Context): EventLis
             }
             "useVoiceEnhancer", "useAdvancedGain" -> {
                 scope.launch {
-                    if (wakeWordJob != null && wakeWordJob!!.isActive) {
+                    if (audioInJob != null && audioInJob!!.isActive) {
                         restartWakeWordDetection()
                     }
                 }
@@ -278,23 +277,52 @@ internal class BackgroundTaskController (private val context: Context): EventLis
             audioInJob = scope.launch {
                 Timber.i("Started input audio")
                 audioRecorder.startRecording()
-                    .collect { audioBuffer ->
-                        var audioLevel = audioBuffer.max()
+                    .collect { audioChunk ->
+                        var audioLevel = audioChunk.floats.max()
 
                         if (!config.isMuted) {
-                            if (wakeWordEngine != null) wakeWordEngine!!.processAudio(
-                                audioBuffer
-                            )
-                            when (audioRoute) {
-                                AudioRouteOption.DETECT -> {
-                                    // Test
+                            // microWakeWord detection using raw PCM ByteBuffer
+                            if (wakeWordDetector != null && audioRoute == AudioRouteOption.DETECT) {
+                                val detections = wakeWordDetector!!.detect(audioChunk.raw)
+                                for (detection in detections) {
+                                    Timber.i("${detection.wakeWordPhrase} wake word detected (probability: ${detection.probability})")
+                                    firebase.logEvent(
+                                        FirebaseManager.WAKE_WORD_DETECTED, mapOf(
+                                            "wake_word" to config.wakeWord,
+                                            "prediction" to detection.probability.toString()
+                                        )
+                                    )
+                                    // Wake screen if configured
+                                    if (config.screenOnWakeWord) {
+                                        config.eventBroadcaster.notifyEvent(Event("screenWake", "", ""))
+                                    }
+                                    // Play wake word sound
+                                    if (config.wakeWordSound != "none") {
+                                        try {
+                                            SoundClipPlayer(
+                                                context,
+                                                context.resources.getIdentifier(
+                                                    config.wakeWordSound,
+                                                    "raw",
+                                                    context.packageName
+                                                )
+                                            ).play()
+                                        } catch (e: Exception) {
+                                            Timber.e("Error playing wake word sound: ${e.message.toString()}")
+                                        }
+                                    }
+                                    BroadcastSender.sendBroadcast(context, BroadcastSender.WAKE_WORD_DETECTED)
                                 }
+                                // Update detection level for diagnostics
+                                holdLastDetectionLevel(wakeWordDetector!!.getCurrentMaxProbability())
+                            }
 
+                            when (audioRoute) {
                                 AudioRouteOption.STREAM -> {
                                     if (config.useAdvancedGain) {
-                                        server.sendAudio(audioDSP.floatArrayToByteBuffer(audioBuffer))
+                                        server.sendAudio(audioDSP.floatArrayToByteBuffer(audioChunk.floats))
                                     } else {
-                                        val gAudioBuffer = audioDSP.autoGain(audioBuffer, config.micGain)
+                                        val gAudioBuffer = audioDSP.autoGain(audioChunk.floats, config.micGain)
                                         val bAudioBuffer = audioDSP.floatArrayToByteBuffer(gAudioBuffer)
                                         audioLevel = gAudioBuffer.max()
                                         server.sendAudio(bAudioBuffer)
@@ -329,7 +357,7 @@ internal class BackgroundTaskController (private val context: Context): EventLis
             show = config.diagnosticsEnabled,
             audioLevel = audioLevel * 100,
             detectionLevel = detectionLevel * 10,
-            detectionThreshold = config.wakeWordThreshold * 10,
+            detectionThreshold = 0f, // microWakeWord models have built-in thresholds
             wakeWord = config.wakeWord,
             mode = audioRoute
         )
@@ -355,67 +383,46 @@ internal class BackgroundTaskController (private val context: Context): EventLis
             return
         }
 
-        if (wakeWordEngine != null && wakeWordJob!!.isActive) {
+        if (wakeWordDetector != null) {
             stopOpenWakeWordDetection()
         }
 
+        try {
+            val wakeWordProvider = CombinedWakeWordProvider(context)
+            wakeWordDetector = WakeWordDetector(wakeWordProvider)
 
-        val wakeWords = WakeWords(context).getWakeWords()
-        if (config.wakeWord in wakeWords.keys) {
-            val wakeWordInfo = wakeWords[config.wakeWord]!!
-            val models = listOf(
-                WakeWordModel(name = wakeWordInfo.name, modelPath = wakeWordInfo.fileName, builtIn = wakeWordInfo.builtIn, threshold = config.wakeWordThreshold)
-            )
-            Timber.i("Starting wake word detection with params: $models")
-            wakeWordEngine = WakeWordEngine(
-                context = context,
-                models = models,
-                detectionMode = DetectionMode.SINGLE_BEST,
-                detectionCooldownMs = 1500L,
-                scope = CoroutineScope(Dispatchers.Default)
-            )
-            Timber.i("Wake word detection started")
-            audioRoute = AudioRouteOption.DETECT
+            // Map the config wake word to the microWakeWord model ID
+            val wakeWordId = mapWakeWordId(config.wakeWord)
+            val availableIds = wakeWordDetector!!.getAvailableWakeWordIds()
 
-            wakeWordJob = scope.launch {
-                wakeWordEngine?.detections?.collect { detection ->
-                    if (audioRoute == AudioRouteOption.DETECT) {
-                        Timber.i("${detection.model.name} wake word detected at ${detection.score}, theshold is ${config.wakeWordThreshold}")
-                        firebase.logEvent(
-                            FirebaseManager.WAKE_WORD_DETECTED, mapOf(
-                                "wake_word" to config.wakeWord,
-                                "threshold" to config.wakeWordThreshold.toString(),
-                                "prediction" to detection.score.toString()
-                            )
-                        )
-                        // if wake up on ww, send event
-                        if (config.screenOnWakeWord) {
-                            config.eventBroadcaster.notifyEvent(Event("screenWake", "", ""))
-                        }
-
-                        if (config.wakeWordSound != "none") {
-                            try {
-                                SoundClipPlayer(
-                                    context,
-                                    context.resources.getIdentifier(
-                                        config.wakeWordSound,
-                                        "raw",
-                                        context.packageName
-                                    )
-                                ).play()
-                            } catch (e: Exception) {
-                                Timber.e("Error playing wake word sound: ${e.message.toString()}")
-                            }
-                        }
-                        BroadcastSender.sendBroadcast(context, BroadcastSender.WAKE_WORD_DETECTED)
-                    }
-                }
+            if (wakeWordId in availableIds) {
+                wakeWordDetector!!.setActiveWakeWords(listOf(wakeWordId))
+                Timber.i("Started microWakeWord detection with model: $wakeWordId")
+                audioRoute = AudioRouteOption.DETECT
+            } else {
+                Timber.w("Wake word '$wakeWordId' not found in available models: $availableIds")
+                wakeWordDetector?.close()
+                wakeWordDetector = null
+                audioRoute = AudioRouteOption.NONE
             }
-            detectionScoreMonitorJob = scope.launch {
-                wakeWordEngine?.scores?.collect { score ->
-                    holdLastDetectionLevel(score.score)
-                }
-            }
+        } catch (e: Exception) {
+            Timber.e("Failed to start microWakeWord detection: ${e.message}")
+            wakeWordDetector?.close()
+            wakeWordDetector = null
+            audioRoute = AudioRouteOption.NONE
+        }
+    }
+
+    /**
+     * Maps old ONNX-based wake word IDs to microWakeWord model IDs.
+     * Handles naming differences between old and new models.
+     */
+    private fun mapWakeWordId(oldId: String): String {
+        return when (oldId) {
+            "ok_nabu" -> "okay_nabu"
+            "ok_computer" -> "okay_computer"
+            "hey_raspy" -> "hey_rhasspy" // old typo in VACA config
+            else -> oldId
         }
     }
 
@@ -435,7 +442,7 @@ internal class BackgroundTaskController (private val context: Context): EventLis
     }
 
     private fun restartWakeWordDetection() {
-        if (wakeWordJob != null && wakeWordJob!!.isActive) {
+        if (audioInJob != null && audioInJob!!.isActive) {
             Timber.i("Restarting wake word detection")
             stopOpenWakeWordDetection()
             stopInputAudio()
@@ -450,18 +457,9 @@ internal class BackgroundTaskController (private val context: Context): EventLis
         Timber.i("Stopping wake word detection")
         audioRoute = AudioRouteOption.NONE
 
-        if (wakeWordEngine != null) {
-            wakeWordEngine?.stop()
-            wakeWordEngine?.release()
-            wakeWordEngine = null
-        }
-        if (wakeWordJob != null && wakeWordJob!!.isActive) {
-            wakeWordJob?.cancel()
-            wakeWordJob = null
-        }
-        if (detectionScoreMonitorJob != null && detectionScoreMonitorJob!!.isActive) {
-            detectionScoreMonitorJob?.cancel()
-            detectionScoreMonitorJob = null
+        if (wakeWordDetector != null) {
+            wakeWordDetector?.close()
+            wakeWordDetector = null
         }
 
         if (config.diagnosticsEnabled) {

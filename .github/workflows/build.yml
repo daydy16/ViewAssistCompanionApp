@@ -1,0 +1,99 @@
+name: Build Debug APK
+
+on:
+  push:
+    branches: [ dev, main, master ]
+  workflow_dispatch:   # allow manual trigger via GitHub UI
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK, CMake and Platform
+        run: |
+          sdkmanager --install \
+            "platforms;android-36" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1"
+
+      - name: Create dummy google-services.json
+        run: |
+          cat > app/google-services.json << 'EOF'
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "vaca-local-build",
+              "storage_bucket": "vaca-local-build.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:000000000000:android:0000000000000000000000",
+                  "android_client_info": {
+                    "package_name": "com.msp1974.vacompanion"
+                  }
+                },
+                "oauth_client": [],
+                "api_key": [
+                  {
+                    "current_key": "PLACEHOLDER_NOT_FOR_PRODUCTION"
+                  }
+                ],
+                "services": {
+                  "appinvite_service": {
+                    "other_platform_oauth_client": []
+                  }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          EOF
+        # Note: For production builds, store the real file as a GitHub Secret
+        # and replace this step with:
+        # echo "${{ secrets.GOOGLE_SERVICES_JSON }}" > app/google-services.json
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml') }}
+          restore-keys: gradle-
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Find APK
+        id: find-apk
+        run: |
+          APK=$(find app/build/outputs -name '*.apk' -type f | head -1)
+          echo "Found APK: $APK"
+          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: ${{ steps.find-apk.outputs.apk_path }}
+          if-no-files-found: error
+
+      - name: Print APK info
+        run: |
+          APK="${{ steps.find-apk.outputs.apk_path }}"
+          echo "APK size: $(du -h "$APK" | cut -f1)"
+          echo "APK path: $APK"

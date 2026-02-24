@@ -75,3 +75,6 @@ lint/tmp/
 # App Specific cases 
 app/release/output.json
 .idea/codeStyles/
+local.properties
+*.zip
+*.zip:Zone.Identifier
